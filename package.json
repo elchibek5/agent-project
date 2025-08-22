@@ -1,13 +1,15 @@
 {
   "name": "agent-project",
   "version": "1.0.0",
-  "main": "index.js",
   "type": "module",
+  "main": "index.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "dependencies": {
+    "dotenv": "^17.2.1",
     "langchain": "^0.3.31",
+    "openai": "^5.15.0",
     "node-fetch": "^3.3.2"
   }
 }
