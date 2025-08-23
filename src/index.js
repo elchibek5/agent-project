@@ -1,123 +1,151 @@
-// src/index.js
-import fs from "node:fs";
-import path from "node:path";
-import readline from "node:readline";
+import express from 'express';
+import cors from 'cors';
+import morgan from 'morgan';
+import dotenv from 'dotenv';
 
-const OLLAMA_URL = process.env.OLLAMA_URL ?? "http://localhost:11434/api/chat";
-const MODEL = process.env.OLLAMA_MODEL ?? "mistral";
-const CHATLOG_PATH = process.env.CHATLOG_PATH ?? "chatlog.txt";
+dotenv.config();
 
-// In-memory conversation
-const messages = []; // [{ role: "user"|"assistant", content: string }]
+const app = express();
+app.use(cors());
+app.use(express.json({ limit: '2mb' }));
+app.use(morgan('dev'));
 
-// --- Helpers ---
-function nowISO() {
-  return new Date().toISOString().slice(0, 19);
-}
+const PORT = process.env.PORT || 3001;
+const OLLAMA_HOST = process.env.OLLAMA_HOST || 'http://localhost:11434';
+const OLLAMA_MODEL = process.env.OLLAMA_MODEL || 'mistral:latest';
 
-function formatTranscript(msgs) {
-  return msgs.map(m => `[${(m.role || "unknown").toUpperCase()}] ${m.content ?? ""}`).join("\n");
-}
+// Root ping
+app.get('/', (_req, res) => {
+  res.json({ ok: true, service: 'ai-dev-assistant-backend', version: '0.1.0' });
+});
 
-function saveChatlog(filePath = CHATLOG_PATH) {
-  const dir = path.dirname(filePath);
-  if (dir && dir !== ".") fs.mkdirSync(dir, { recursive: true });
-  const header = `\n\n===== CHAT LOG @ ${nowISO()} =====\n`;
-  const body = formatTranscript(messages);
-  const footer = `\n===== END LOG =====\n`;
-  fs.appendFileSync(filePath, header + body + footer, { encoding: "utf-8" });
-  return filePath;
-}
+// Health check + model presence
+app.get('/status', async (_req, res) => {
+  try {
+    const r = await fetch(`${OLLAMA_HOST}/api/tags`);
+    if (!r.ok) throw new Error(`Ollama responded ${r.status}`);
+    const data = await r.json();
+    const hasModel = Array.isArray(data.models)
+      ? data.models.some((m) => m.name === OLLAMA_MODEL || m.model === OLLAMA_MODEL)
+      : false;
 
-// --- Command handler ---
-function handleCommand(cmd) {
-  const c = cmd.trim().toLowerCase();
-
-  if (c === ":clear") {
-    messages.length = 0;
-    console.log("✅ Conversation memory cleared.");
-    return true;
+    res.json({
+      ok: true,
+      ollama: 'up',
+      model: OLLAMA_MODEL,
+      modelInstalled: hasModel,
+      models: data.models?.map((m) => m.name || m.model) || [],
+    });
+  } catch (err) {
+    res.status(503).json({ ok: false, error: String(err) });
   }
+});
 
-  if (c === ":save") {
-    if (messages.length === 0) {
-      console.log("ℹ️ Nothing to save (conversation is empty).");
-    } else {
-      const p = saveChatlog();
-      console.log(`💾 Conversation saved to: ${p}`);
-    }
-    return true;
+// Non-streaming generate
+app.post('/ask', async (req, res) => {
+  const { prompt, model, options } = req.body || {};
+  if (!prompt || typeof prompt !== 'string') {
+    return res.status(400).json({ error: 'prompt (string) is required' });
   }
+  const usedModel = model || OLLAMA_MODEL;
 
-  if (c === ":help" || c === ":h") {
-    console.log("Commands: :clear  (reset memory), :save  (append transcript to chatlog.txt), :help");
-    return true;
-  }
+  try {
+    const r = await fetch(`${OLLAMA_HOST}/api/generate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: usedModel, prompt, stream: false, options }),
+    });
 
-  return false; // not a command
-}
-
-// --- Ollama call (Node 18+ has global fetch) ---
-async function askOllama(userText) {
-  const payload = {
-    model: MODEL,
-    messages: [...messages, { role: "user", content: userText }],
-    stream: false
-  };
-
-  const r = await fetch(OLLAMA_URL, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(payload)
-  });
-
-  if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
-  const data = await r.json();
-  return data?.message?.content ?? "";
-}
-
-// --- REPL loop ---
-async function main() {
-  console.log("Ollama Dev Assistant (type :help for commands)");
-
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-  const prompt = (q) => new Promise(res => rl.question(q, res));
-
-  while (true) {
-    let userText;
-    try {
-      userText = await prompt("\nYou: ");
-    } catch {
-      console.log("\n👋 Exiting.");
-      break;
+    if (!r.ok) {
+      const text = await r.text();
+      return res.status(500).json({ error: 'ollama_error', details: text });
     }
 
-    userText = (userText ?? "").trim();
-    if (!userText) continue;
-
-    // Intercept commands first
-    if (userText.startsWith(":")) {
-      if (handleCommand(userText)) continue;
-    }
-
-    // Normal chat turn
-    messages.push({ role: "user", content: userText });
-
-    let reply = "";
-    try {
-      reply = await askOllama(userText);
-    } catch (e) {
-      console.error("❌ Error contacting Ollama:", e.message);
-      messages.pop(); // rollback last user message on failure
-      continue;
-    }
-
-    messages.push({ role: "assistant", content: reply });
-    console.log(`\nAssistant: ${reply}`);
+    const data = await r.json(); // { response, done, ... }
+    res.json({ model: usedModel, response: data.response, done: data.done });
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
   }
-}
+});
 
-main().catch(err => {
-  console.error("Fatal:", err);
-  process.exit(1);
+// Streaming (SSE-like) generate
+app.post('/ask/stream', async (req, res) => {
+  const { prompt, model, options } = req.body || {};
+  if (!prompt || typeof prompt !== 'string') {
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.write(`event:error\ndata:${JSON.stringify({ error: 'prompt (string) is required' })}\n\n`);
+    return res.end();
+  }
+
+  const usedModel = model || OLLAMA_MODEL;
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders && res.flushHeaders();
+
+  try {
+    const r = await fetch(`${OLLAMA_HOST}/api/generate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: usedModel, prompt, stream: true, options }),
+    });
+
+    if (!r.ok) {
+      const text = await r.text();
+      res.write(`event:error\ndata:${JSON.stringify({ error: 'ollama_error', details: text })}\n\n`);
+      return res.end();
+    }
+
+    const reader = r.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let full = '';
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+
+      let idx;
+      while ((idx = buffer.indexOf('\n')) >= 0) {
+        const line = buffer.slice(0, idx).trim();
+        buffer = buffer.slice(idx + 1);
+        if (!line) continue;
+
+        try {
+          const json = JSON.parse(line); // Ollama streams one JSON object per line
+          const piece = json.response || '';
+          if (piece) {
+            full += piece;
+            res.write(`data:${JSON.stringify({ text: piece })}\n\n`);
+          }
+          if (json.done) {
+            res.write(`event:done\ndata:${JSON.stringify({ model: usedModel, totalChars: full.length })}\n\n`);
+            return res.end();
+          }
+        } catch {
+          // Ignore partial JSON; it will complete in the next chunk
+        }
+      }
+    }
+
+    // If stream ended without explicit done
+    res.write(`event:done\ndata:${JSON.stringify({ model: usedModel, totalChars: full.length })}\n\n`);
+    res.end();
+  } catch (err) {
+    res.write(`event:error\ndata:${JSON.stringify({ error: String(err) })}\n\n`);
+    res.end();
+  }
+});
+
+// 404
+app.use((req, res) => {
+  res.status(404).json({ error: 'Not found', path: req.path });
+});
+
+app.listen(PORT, () => {
+  console.log(`➡️  Server listening on http://localhost:${PORT}`);
+  console.log(`➡️  Using Ollama at ${OLLAMA_HOST} (model: ${OLLAMA_MODEL})`);
 });
